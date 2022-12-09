@@ -1,0 +1,411 @@
+# Alan Foley alan_foley@live.co.uk pAdDelta 09/12/22
+# adapted from code by Colin Clarke
+
+
+# trimgalore
+
+cat data/sample_info.txt | while read sample; do
+trim_galore --paired data/raw/"$sample"_L001_R1_001.fastq.gz data/raw/"$sample"_L001_R2_001.fastq.gz -o data/preprocessed/paired
+done
+
+
+# bowtie build
+
+mkdir unshifted
+mkdir shifted
+
+bowtie2-build reference_genome/unshifted/wt.fasta unshifted/bowtie
+
+bowtie2-build reference_genome/shifted/wt.fasta shifted/bowtie
+
+
+# wt genome mapping
+# needed to remove -S from mapping because bowtie 2 has standardout
+
+
+for mode in unshifted shifted; do
+  mkdir -p bwa_mapping/$mode
+  cat data/sample_info.txt | while read sample; do
+    # map
+    bowtie2 -x $mode/bowtie \
+    -1 data/preprocessed/paired/"$sample"_L001_R1_001_val_1.fq.gz \
+    -2 data/preprocessed/paired/"$sample"_L001_R2_001_val_2.fq.gz \
+    -k 10 \
+    > bwa_mapping/$mode/"$sample".sam;
+
+    # sort
+    java -jar  /home/alan/bin/picard.jar SortSam \
+    INPUT=bwa_mapping/$mode/"$sample".sam \
+    OUTPUT=bwa_mapping/$mode/"$sample".unfiltered.bam \
+    SORT_ORDER=coordinate;
+
+    # filter
+    samtools view -bq 20 \
+    bwa_mapping/$mode/"$sample".unfiltered.bam \
+    > bwa_mapping/$mode/"$sample".bam
+
+    # remove SAM
+    rm bwa_mapping/$mode/"$sample".sam # remove the sam file
+  done
+done
+
+
+
+
+# mark duplicates
+
+
+for mode in unshifted shifted; do
+  mkdir bwa_mapping/$mode/duplicate_marked bwa_mapping/$mode/added_read_group
+  cat data/sample_info.txt | while read sample; do
+    # Mark duplicates for checking how many are duplicates
+    java -jar  /home/alan/bin/picard.jar MarkDuplicates \
+    INPUT=bwa_mapping/$mode/"$sample".bam \
+    OUTPUT=bwa_mapping/$mode/duplicate_marked/"$sample".DUPTEST.bam \
+    METRICS_FILE=/dev/null
+
+    # Mark duplicates with removed duplicate reads
+    java -jar  /home/alan/bin/picard.jar MarkDuplicates \
+    INPUT=bwa_mapping/$mode/"$sample".bam \
+    OUTPUT=bwa_mapping/$mode/duplicate_marked/"$sample".bam \
+    REMOVE_DUPLICATES=TRUE \
+    METRICS_FILE=/dev/null
+
+    # Add read groups
+    java -jar  /home/alan/bin/picard.jar AddOrReplaceReadGroups \
+    I=bwa_mapping/$mode/duplicate_marked/"$sample".bam \
+    O=bwa_mapping/$mode/added_read_group/"$sample".bam \
+    RGSM="$sample" \
+    RGLB=mtdna_seq \
+    RGPL=illumina \
+    RGPU=none \
+    VALIDATION_STRINGENCY=LENIENT;
+  done
+done
+
+
+
+## mapping statistics
+
+mkdir -p plotting_data/mapping_statistics/mapping_rates
+mkdir  -p plotting_data/mapping_statistics/coverage/perbase_coverage/unshifted
+mkdir  -p plotting_data/mapping_statistics/coverage/perbase_coverage/shifted
+
+
+cat data/sample_info.txt | while read sample; do
+  samtools depth bwa_mapping/unshifted/added_read_group/$sample.bam | \
+  awk '{sum+=$3} END { print "'$sample'",sum/NR}' >> plotting_data/mapping_statistics/coverage/sample_depth
+
+  samtools depth bwa_mapping/unshifted/added_read_group/$sample.bam > \
+  plotting_data/mapping_statistics/coverage/perbase_coverage/unshifted/$sample.perbase.coverage
+
+  samtools depth bwa_mapping/shifted/added_read_group/$sample.bam > \
+  plotting_data/mapping_statistics/coverage/perbase_coverage/shifted/$sample.perbase.coverage
+
+  bamtools stats -in bwa_mapping/shifted/added_read_group/$sample.bam > \
+  plotting_data/mapping_statistics/mapping_rates/$sample.map.rates
+
+  total_reads=$(bamtools stats -in bwa_mapping/unshifted/"$sample".unfiltered.bam  | grep 'Total reads' | awk '{print $3}')
+
+  mapped_reads=$(bamtools stats -in bwa_mapping/unshifted/duplicate_marked/"$sample".DUPTEST.bam | grep 'Mapped reads' | awk '{print $3}')
+
+  duplicates=$(bamtools stats -in bwa_mapping/unshifted/duplicate_marked/"$sample".DUPTEST.bam  | grep 'Duplicates' | awk '{print $2}')
+
+  echo -e $sample'\t'$total_reads'\t'$mapped_reads'\t'$duplicates >> plotting_data/mapping_statistics/mapping_rates.txt
+done
+
+
+
+
+
+# R scripts for nicks iseq
+# alan foley alan_foley@live.co.uk
+
+
+install.packages("highr")
+install.packages("knitr")
+install.packages("stringr")
+install.packages("selectr")
+install.packages("assertthat")
+install.packages("dbplyr")
+install.packages("cellranger")
+install.packages("googlesheets4")
+install.packages("rmarkdown")
+install.packages("rvest")
+install.packages("reprex")
+install.packages("readx1")
+install.packages("RColorBrewer")
+install.packages("scales")
+install.packages("xlsx")
+install.packages("colorRamps")
+install.packages("tidyverse")
+
+library(forcats)
+library(tidyr)
+library(dplyr)
+library(RColorBrewer)
+library("tidyverse")
+library(scales)
+library(xlsx)
+library(colorRamps)
+library(ggplot2)
+library(stringr)
+
+theme_ms <- function(base_size = 10, base_family = "Helvetica") {
+  library(grid)
+  (theme_bw(base_size = base_size, base_family = base_family) +
+      theme(
+        text = element_text(color = "black"),
+        axis.title = element_text(face = "bold", size = rel(1)),
+        plot.title = element_text(face = "bold", size = rel(1)),
+        axis.text = element_text(size = rel(1), color = "black"),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key.size = unit(0.8, "lines"),
+        panel.border = element_rect(color = "black", size = 1),
+        panel.grid = element_blank()
+      ))
+}
+
+# create a directory for saving figures
+figsdir <- "./figures/"
+if (!dir.exists(figsdir)) {
+  dir.create(figsdir)
+}
+
+tabsdir <- "./tables/"
+if (!dir.exists(tabsdir)) {
+  dir.create(tabsdir)
+}
+
+# function to save figures
+saveManuscriptPlot <- function(p, width, height) {
+  figfile <- file.path(figsdir, sprintf(
+    "%s.png",
+    gsub("\\.", "_", deparse(substitute(p)))
+  ))
+  ggsave(figfile, plot = p, width = width, height = height, units = "in", device = "png")
+  
+  fill.gradient <- scale_fill_gradientn(
+    colors = matlab.like(200),
+    trans = "log10"
+  )
+}
+```
+# Sequencing
+## Read Mapping
+
+mapping_data_unshifted <- read.table(file = "plotting_data/mapping_statistics/mapping_rates.txt")
+
+mapping_data_unshifted <- mapping_data_unshifted %>%
+  mutate(
+    sample_name = V1,
+    Unmapped = V2 - V3,
+    Duplicates = V4,
+    Unique = V3 - V4
+  ) %>%
+  select(sample_name, Unmapped, Duplicates, Unique)
+
+write.xlsx(x = mapping_data_unshifted, 
+           sheetName = "Read Mapping", 
+           file = "tables/Supplementary Data.xlsx",
+           append = F )
+
+mapping_data_unshifted <- mapping_data_unshifted %>%
+  pivot_longer(
+    cols = c("Unmapped", "Duplicates", "Unique"),
+    names_to = "Variable",
+    values_to = "Reads"
+  )
+
+mapping_data_unshifted$Variable <- fct_relevel(factor(mapping_data_unshifted$Variable), c("Unmapped", "Duplicates", "Unique"))
+
+scientific <- function(x) {
+  ifelse(x == 0, "0", parse(text = gsub("[+]", "", gsub("e", " %*% 10^", scientific_format()(x)))))
+}
+
+sample_order <- c("NGS1","NGS2","NGS3","NGS4","NGS5","NGS6","NGS7","NGS8")
+
+Fig1_read_mapping <- mapping_data_unshifted %>%
+  mutate(sample_name = case_when(
+    sample_name == "NGS1_S1" ~ "NGS1",
+    sample_name == "NGS2_S7" ~ "NGS2",
+    sample_name == "NGS3_S2" ~ "NGS3",
+    sample_name == "NGS4_S8" ~ "NGS4",
+    sample_name == "NGS5_S3" ~ "NGS5",
+    sample_name == "NGS6_S4" ~ "NGS6",
+    sample_name == "NGS7_S5" ~ "NGS7",
+    sample_name == "NGS8_S6" ~ "NGS8"
+  )) %>%
+  ggplot(aes(x = sample_name, y = Reads, fill = Variable)) +
+  geom_bar(position = "stack", stat = "identity") +
+  theme_ms() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(fill = "", y = "# Reads", x = "", title = "Read mapping of 1-8 with paddelta") +
+  theme(legend.position = "right") +
+  scale_y_continuous(
+    expand = c(0, 10000),
+    labels = scientific
+  ) +
+  scale_fill_brewer(palette = "Set1")
+
+
+saveManuscriptPlot(Fig1_read_mapping, 10, 5)
+Fig1_read_mapping
+```
+
+
+
+
+## Average sample coverage
+
+```{r}
+average_cell_line_coverage <- read.table("plotting_data/mapping_statistics/coverage/sample_depth", header = F)
+
+average_cell_line_coverage <- average_cell_line_coverage %>%
+  mutate(
+    sample_name = as.factor(V1),
+    average_coverage = V2
+  ) %>%
+  mutate(sample_name = case_when(
+    sample_name == "NGS1_S1" ~ "NGS1",
+    sample_name == "NGS2_S7" ~ "NGS2",
+    sample_name == "NGS3_S2" ~ "NGS3",
+    sample_name == "NGS4_S8" ~ "NGS4",
+    sample_name == "NGS5_S3" ~ "NGS5",
+    sample_name == "NGS6_S4" ~ "NGS6",
+    sample_name == "NGS7_S5" ~ "NGS7",
+    sample_name == "NGS8_S6" ~ "NGS8"
+  )) %>%
+  select(sample_name, average_coverage)
+
+write.xlsx(x = average_cell_line_coverage, 
+           sheetName = "Average Sample Coverage", 
+           file = "tables/Supplementary Data.xlsx",
+           append = T )
+
+average_cell_line_coverage$sample_name <- factor(average_cell_line_coverage$sample_name, 
+                                             levels = sample_order)
+
+Fig2_average_sample_coverage <- average_cell_line_coverage %>%
+  ggplot(aes(x = sample_name, y = average_coverage)) +
+  geom_bar(stat = "identity", fill = "#377EB8") +
+  labs(x = "", y = "Depth of Coverage", title = "Average sequencing depth for each sample") +
+  theme_ms() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+saveManuscriptPlot(Fig2_average_sample_coverage, 10, 5)
+Fig2_average_sample_coverage
+```
+
+
+
+
+
+
+## Perbase coverage
+
+
+```{r}
+perbase_cell_files_unshifted <- list.files("plotting_data/mapping_statistics/coverage/perbase_coverage/unshifted/", full.names = T)
+
+perbase_cell_files_shifted <- list.files("plotting_data/mapping_statistics/coverage/perbase_coverage/shifted/", full.names = T)
+
+perbase_unshifted <- do.call("rbind", lapply(perbase_cell_files_unshifted, function(fn) {
+  data.frame(Filename = fn, read.table(fn))
+})) %>%
+  select(Filename, V2, V3) %>%
+  mutate(
+    perbase = V3,
+    position = V2
+  ) %>%
+  mutate(Filename = str_remove(Filename, "plotting_data/mapping_statistics/coverage/perbase_coverage/unshifted/")) %>%
+  mutate(Filename = str_remove(Filename, ".perbase.coverage")) %>%
+  mutate(sample_name = case_when(
+    Filename == "/NGS1_S1" ~ "NGS1",
+    Filename == "/NGS2_S7" ~ "NGS2",
+    Filename == "/NGS3_S2" ~ "NGS3",
+    Filename == "/NGS4_S8" ~ "NGS4",
+    Filename == "/NGS5_S3" ~ "NGS5",
+    Filename == "/NGS6_S4" ~ "NGS6",
+    Filename == "/NGS7_S5" ~ "NGS7",
+    Filename == "/NGS8_S6" ~ "NGS8"
+  )) %>%
+  select(sample_name, position, perbase)
+
+sample_order <- c("NGS1","NGS2","NGS3","NGS4","NGS5","NGS6","NGS7","NGS8")
+
+perbase_unshifted$sample_name <- factor(perbase_unshifted$sample_name, 
+                                             levels = sample_order)
+
+perbase_shifted <- do.call("rbind", lapply(perbase_cell_files_shifted, function(fn) {
+  data.frame(Filename = fn, read.table(fn))
+})) %>%
+  select(Filename, V2, V3) %>%
+  mutate(
+    perbase = V3,
+    position = V2
+  ) %>%
+  mutate(Filename = str_remove(Filename, "plotting_data/mapping_statistics/coverage/perbase_coverage/shifted/")) %>%
+  mutate(Filename = str_remove(Filename, ".perbase.coverage")) %>%
+mutate(sample_name = case_when(
+    Filename == "/NGS1_S1" ~ "NGS1",
+    Filename == "/NGS2_S7" ~ "NGS2",
+    Filename == "/NGS3_S2" ~ "NGS3",
+    Filename == "/NGS4_S8" ~ "NGS4",
+    Filename == "/NGS5_S3" ~ "NGS5",
+    Filename == "/NGS6_S4" ~ "NGS6",
+    Filename == "/NGS7_S5" ~ "NGS7",
+    Filename == "/NGS8_S6" ~ "NGS8"
+  )) %>%
+  select(sample_name, position, perbase)
+
+perbase_shifted$sample_name <- factor(perbase_shifted$sample_name, 
+                                             levels = sample_order)
+
+Fig3_unshifted_average_perbase_coverage <- perbase_unshifted %>%
+  group_by(position) %>%
+  summarise(mean_cov = mean(perbase)) %>%
+  ggplot(aes(x = position, y = mean_cov)) +
+  geom_line(color = "#377EB8") +
+  labs(y = "Depth of Coverage", x = "paddelta position (bp)", title = "Average perbase coverage for NGS 1-8 against unshifted paddelta") +
+  theme_ms()
+
+Fig4_shifted_average_perbase_coverage <- perbase_shifted %>%
+  group_by(position) %>%
+  summarise(mean_cov = mean(perbase)) %>%
+  ggplot(aes(x = position, y = mean_cov)) +
+  geom_line(color = "#377EB8") +
+  labs(y = "Depth of Coverage", x = "paddelta position (bp)", title = "Average perbase coverage for NGS 1-8 against shifted paddelta") +
+  theme_ms()
+
+Fig5_unshifted_perbase_coverage_all_samples <- perbase_unshifted %>%
+  ggplot(aes(x = position, y = perbase)) +
+  geom_line(color = "#377EB8") +
+  facet_wrap(~sample_name, ncol = 2) +
+  labs(y = "Depth of Coverage", x = "paddelta position (bp)", title = "Perbase coverage for NGS 1-8 against unshifted paddelta") +
+  theme_ms()
+
+Fig6_shifted_perbase_coverage_all_samples <- perbase_shifted %>%
+  ggplot(aes(x = position, y = perbase)) +
+  geom_line(color = "#377EB8") +
+  facet_wrap(~sample_name, ncol = 2) +
+  labs(y = "Depth of Coverage", x = "paddelta position (bp)", title = "Perbase coverage for NGS 1-8 against shifted paddelta") +
+  theme_ms()
+
+saveManuscriptPlot(Fig3_unshifted_average_perbase_coverage, 10, 5)
+Fig3_unshifted_average_perbase_coverage
+saveManuscriptPlot(Fig4_shifted_average_perbase_coverage, 10, 5)
+Fig4_shifted_average_perbase_coverage
+```
+
+```{r fig.height=15, fig.width=10}
+saveManuscriptPlot(Fig5_unshifted_perbase_coverage_all_samples, 10, 10)
+
+saveManuscriptPlot(Fig6_shifted_perbase_coverage_all_samples, 10, 10)
+Fig5_unshifted_perbase_coverage_all_samples
+Fig6_shifted_perbase_coverage_all_samples
+
+```
+
