@@ -1,4 +1,5 @@
-# NickiSeq
+# iSeq
+# Alan Foley alan_foley@live.co.uk
+# link to paper: 
 iSeq NGS of plasmid DNA
-# link to raw data https://drive.google.com/file/d/1JP0Oh8GJ2k6_1tA-w1Hfa0XftCgaS98O/view?usp=sharing
-
+# link to raw data: https://drive.google.com/file/d/1JP0Oh8GJ2k6_1tA-w1Hfa0XftCgaS98O/view?usp=sharing
